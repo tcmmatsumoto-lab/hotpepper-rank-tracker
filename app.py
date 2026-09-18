@@ -17,7 +17,7 @@ setup_playwright()
 
 st.set_page_config(page_title="HotPepper順位トラッカー", layout="centered")
 st.title("HotPepper 順位トラッカー")
-st.caption("小エリアページから検索フォームを実行し、正確な掲載順位を測定します。")
+st.caption("小エリアページから検索フォームを実行し、掲載順位を測定します。")
 
 # 1. Googleスプレッドシートの読み込み
 SHEET_ID = "1HGmMHV4dEUQUy9VFEIc32erKUrhdOFUd4kYN-oEA4-c"
@@ -85,7 +85,7 @@ if df_areas is not None and not df_areas.empty:
     matched_row = filtered_mid[filtered_mid["_small"] == selected_small_name]
     if not matched_row.empty:
         selected_url = matched_row["_url"].values[0]
-        # 池袋なのにmacAB（新橋）になっている場合の自動補正
+        # 池袋西口コード(sacX007)とmacABの不整合を自動補正
         if "sacX007" in selected_url and "macAB" in selected_url:
             selected_url = selected_url.replace("macAB", "macAE")
         st.info(f"📌 開く小エリアURL: `{selected_url}`")
@@ -96,14 +96,14 @@ else:
 
 col_shop, col_kw = st.columns(2)
 with col_shop:
-    shop_name = st.text_input("自店舗名（部分一致OK）", placeholder="例: LUMICIA", key="ui_shop_key")
+    shop_name = st.text_input("自店舗名（部分一致OK）", placeholder="", key="ui_shop_key")
 with col_kw:
-    keyword = st.text_input("検索キーワード", placeholder="例: 眉毛", key="ui_kw_key")
+    keyword = st.text_input("検索キーワード", placeholder="", key="ui_kw_key")
 
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. 完全ブラウザ操作検索ロジック
+# 3. 軽量化ブラウザ操作検索ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
@@ -123,6 +123,8 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-extensions",
+                "--no-zygote",
+                "--single-process",
                 "--mute-audio"
             ]
         )
@@ -132,24 +134,24 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         )
         page = await context.new_page()
 
-        # 画像やフォント等の不要リソースをブロックして高速化
-        await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", lambda r: r.abort())
+        # 画像、メディア、フォントをブロックしてメモリ消費を抑制
+        await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2,mp4}", lambda r: r.abort())
 
         target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
         add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
         try:
-            await page.goto(target_area_url, wait_until="domcontentloaded", timeout=30000)
+            # domcontentloaded より早く軽量な commit レベルで読み込み
+            await page.goto(target_area_url, wait_until="commit", timeout=30000)
             await asyncio.sleep(2)
         except Exception as e:
             add_log(f"❌ ページアクセス失敗: {e}")
             await browser.close()
             return 0, False, ""
 
-        # フォームに直接キーワードをセットして送信
         add_log(f"2️⃣ **検索ウィンドウに「{target_kw}」を入力して検索を実行します...**")
-        
-        # JavaScript経由でフリーワード欄に値を入れ、検索フォームを直接submit
+
+        # JavaScriptでフォームを安全に特定して送信
         search_executed = await page.evaluate(f'''() => {{
             let inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])'));
             let targetInput = inputs.find(i => 
@@ -170,16 +172,15 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
 
         if search_executed:
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=25000)
+                await page.wait_for_load_state("commit", timeout=25000)
             except Exception:
                 pass
         else:
-            # フォールバック：通常のPlaywright入力
             inp = await page.query_selector("input[name*='fw'], input#freeword, .searchBox input")
             if inp:
                 await inp.fill(target_kw)
                 await inp.press("Enter")
-                await page.wait_for_load_state("domcontentloaded", timeout=25000)
+                await page.wait_for_load_state("commit", timeout=25000)
             else:
                 add_log("❌ 検索窓が見つかりませんでした。")
                 await browser.close()
@@ -203,10 +204,9 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                     next_url = f"{cur_url.rstrip('/')}/PN{page_idx}.html"
 
                 add_log(f"\n🔍 **{page_idx}ページ目をスキャン中...** (`{next_url}`)")
-                await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
+                await page.goto(next_url, wait_until="commit", timeout=25000)
                 await asyncio.sleep(2)
 
-            # 店舗カセット内の店舗名リンクを収集
             links = await page.query_selector_all("a[href*='/kr/slnH']")
 
             page_shops = []
@@ -225,7 +225,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 raw_text = (await link.inner_text()).strip()
                 salon_name = raw_text.split("\n")[0].strip()
 
-                # 写真枚数（〇枚）やボタンテキストを除外
                 if re.search(r"^\d+枚$", salon_name) or len(salon_name) <= 2:
                     continue
                 if any(bad in salon_name for bad in ["空席確認", "予約する", "地図を見る", "クーポン一覧"]):
