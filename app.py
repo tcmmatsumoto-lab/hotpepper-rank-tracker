@@ -5,7 +5,7 @@ import pandas as pd
 import re
 from playwright.async_api import async_playwright
 
-# Streamlit Cloud環境のみ Playwrightブラウザを確実にセットアップ
+# Streamlit Cloud環境でPlaywrightブラウザを確実にセットアップ
 @st.cache_resource
 def setup_playwright():
     try:
@@ -100,15 +100,19 @@ with col_kw:
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. クラウド安定起動オプション付き計測ロジック
+# 3. 低メモリ・高安定性 Playwright計測ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
         logs.append(msg)
         log_box.markdown("\n\n".join(logs))
 
+    current_rank = 0
+    found = False
+    target_found_name = ""
+
     async with async_playwright() as p:
-        # Linux/クラウド環境でもクラッシュしないための厳格な起動オプション
+        # Streamlit Cloudの超小容量メモリ（1GB制限）下でも落ちない最小限リソース起動
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -117,28 +121,49 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-zygote",
-                "--single-process"
+                "--single-process",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-extensions",
+                "--disable-sync",
+                "--disable-translate",
+                "--hide-scrollbars",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
+                "--js-flags=--max-old-space-size=512"
             ]
         )
+        
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900}
+            viewport={"width": 1280, "height": 800}
         )
         page = await context.new_page()
-        await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", lambda r: r.abort())
+
+        # 画像、スタイル、メディア、フォントなどの不要リソースをすべてカットしてメモリ解放
+        async def block_resources(route):
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", block_resources)
 
         target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
         add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
         try:
-            await page.goto(target_area_url, wait_until="domcontentloaded", timeout=30000)
+            # wait_until="commit" によりHTMLの到達時点で即座に次の処理へ進め、クラッシュを防ぐ
+            await page.goto(target_area_url, wait_until="commit", timeout=30000)
             await asyncio.sleep(2)
         except Exception as e:
             add_log(f"❌ ページアクセス失敗: {e}")
             await browser.close()
             return 0, False, ""
 
-        # 検索窓の特定
+        # 検索窓口の特定
         search_input = None
         inputs = await page.query_selector_all("input")
         for inp in inputs:
@@ -169,13 +194,14 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
             await browser.close()
             return 0, False, ""
 
-        await search_input.scroll_into_view_if_needed()
+        # キーワード入力
         await search_input.click()
         await search_input.fill("")
         await search_input.fill(target_kw)
         add_log(f"2️⃣ **検索ウィンドウに「{target_kw}」を入力しました。**")
         await asyncio.sleep(0.5)
 
+        # 検索実行
         add_log("3️⃣ **検索ボタンを押して検索を実行します...**")
         submitted = False
         btn_candidates = await page.query_selector_all("button, input[type='submit'], a.btnSearch, a.searchBtn")
@@ -183,7 +209,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
             try:
                 txt = (await btn.inner_text() or await btn.get_attribute("value") or "").strip()
                 if "検索" in txt and await btn.is_visible():
-                    async with page.expect_navigation(wait_until="domcontentloaded", timeout=25000):
+                    async with page.expect_navigation(wait_until="commit", timeout=25000):
                         await btn.click()
                     submitted = True
                     break
@@ -192,7 +218,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
 
         if not submitted:
             try:
-                async with page.expect_navigation(wait_until="domcontentloaded", timeout=25000):
+                async with page.expect_navigation(wait_until="commit", timeout=25000):
                     await search_input.press("Enter")
                 submitted = True
             except Exception:
@@ -201,11 +227,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         await asyncio.sleep(2)
         add_log(f"✅ **検索結果ページが表示されました:**\n`{page.url}`")
 
-        current_rank = 0
-        found = False
-        target_found_name = ""
-
-        # サロン一覧の抽出
+        # 順位判定
         for page_idx in range(1, search_pages + 1):
             if page_idx > 1:
                 cur_url = page.url
@@ -218,7 +240,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                     next_url = f"{cur_url.rstrip('/')}/PN{page_idx}.html"
 
                 add_log(f"\n🔍 **{page_idx}ページ目をスキャン中...** (`{next_url}`)")
-                await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
+                await page.goto(next_url, wait_until="commit", timeout=25000)
                 await asyncio.sleep(2)
 
             links = await page.query_selector_all("a[href*='/kr/slnH']")
@@ -293,4 +315,3 @@ if st.button("順位を計測する", type="primary", key="ui_btn_measure"):
             st.metric(label=f"「{selected_small_name}」×「{keyword}」の検索順位", value=f"{rank} 位")
         else:
             st.warning(f"指定された {max_pages} ページ以内（計 {rank} 店舗中）に「{shop_name}」は見つかりませんでした。")
-            
