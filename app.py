@@ -3,7 +3,6 @@ import streamlit as st
 import asyncio
 import pandas as pd
 import re
-from urllib.parse import quote
 from playwright.async_api import async_playwright
 
 # Streamlit Cloud環境用セットアップ
@@ -18,7 +17,7 @@ setup_playwright()
 
 st.set_page_config(page_title="HotPepper順位トラッカー", layout="centered")
 st.title("HotPepper 順位トラッカー")
-st.caption("小エリアURLへ直接キーワードを渡して正確な順位を測定します。")
+st.caption("小エリアURLからキーワード検索を実行し、正確な掲載店舗名のみを抽出して順位を判定します。")
 
 # 1. Googleスプレッドシートの読み込み
 SHEET_ID = "1HGmMHV4dEUQUy9VFEIc32erKUrhdOFUd4kYN-oEA4-c"
@@ -86,7 +85,7 @@ if df_areas is not None and not df_areas.empty:
     matched_row = filtered_mid[filtered_mid["_small"] == selected_small_name]
     if not matched_row.empty:
         selected_url = matched_row["_url"].values[0]
-        st.info(f"📌 対象小エリアURL: `{selected_url}`")
+        st.info(f"📌 開く小エリアURL: `{selected_url}`")
     else:
         st.warning("⚠️ エリアURLが見つかりませんでした。")
 else:
@@ -101,22 +100,15 @@ with col_kw:
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. 小エリアURL直結検索ロジック
+# 3. 成功時ベースの検索実行＆サロン判定ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
         logs.append(msg)
         log_box.markdown("\n\n".join(logs))
 
-    current_rank = 0
-    found = False
-    target_found_name = ""
-
-    # 小エリアURLのジャンル部（nail/relax/este）のみを画面の選択肢に合わせて置換
-    base_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/")
-    encoded_kw = quote(target_kw)
-
     async with async_playwright() as p:
+        # Linuxコンテナ環境クラッシュ防止の必須起動オプション
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -124,38 +116,113 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-extensions",
-                "--no-zygote",
-                "--single-process",
                 "--mute-audio"
             ]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1280, "height": 900}
         )
         page = await context.new_page()
+        await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", lambda r: r.abort())
 
-        # 画像やフォント等の不要リソースをブロックして超高速・省メモリ化
-        await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2,css}", lambda r: r.abort())
+        # 1. 小エリアURLを開く
+        target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
+        add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
-        for page_idx in range(1, search_pages + 1):
-            # 小エリアURLに直接キーワードを付与（中・小コードの抜き出し不要）
-            if page_idx == 1:
-                search_url = f"{base_url}/?fw={encoded_kw}"
-            else:
-                search_url = f"{base_url}/PN{page_idx}.html?fw={encoded_kw}"
+        try:
+            await page.goto(target_area_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            add_log(f"❌ ページアクセス失敗: {e}")
+            await browser.close()
+            return 0, False, ""
 
-            add_log(f"🔍 **{page_idx}ページ目を検索中...**\n`{search_url}`")
-
+        # 2. 検索窓口の特定
+        search_input = None
+        inputs = await page.query_selector_all("input")
+        for inp in inputs:
             try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                add_log(f"⚠️ ページアクセス失敗: {e}")
-                break
+                inp_type = (await inp.get_attribute("type") or "text").lower()
+                if inp_type in ["text", "search"]:
+                    name_attr = (await inp.get_attribute("name") or "").lower()
+                    id_attr = (await inp.get_attribute("id") or "").lower()
+                    ph_attr = (await inp.get_attribute("placeholder") or "").lower()
+                    if any(k in name_attr or k in id_attr or k in ph_attr for k in ["fw", "free", "word", "keyword", "サロン", "キーワード"]):
+                        search_input = inp
+                        break
+            except Exception:
+                continue
 
-            # サロン店舗リンク（/slnH.../）のみを抽出
+        if not search_input:
+            for inp in inputs:
+                try:
+                    inp_type = (await inp.get_attribute("type") or "text").lower()
+                    if inp_type in ["text", "search"] and await inp.is_visible():
+                        search_input = inp
+                        break
+                except Exception:
+                    continue
+
+        if not search_input:
+            add_log("❌ 検索窓が見つかりませんでした。")
+            await browser.close()
+            return 0, False, ""
+
+        # 3. 入力して検索を実行
+        await search_input.scroll_into_view_if_needed()
+        await search_input.click()
+        await search_input.fill("")
+        await search_input.fill(target_kw)
+        add_log(f"2️⃣ **検索ウィンドウに「{target_kw}」を入力しました。**")
+        await asyncio.sleep(0.5)
+
+        add_log("3️⃣ **検索ボタンを押して検索を実行します...**")
+        submitted = False
+        btn_candidates = await page.query_selector_all("button, input[type='submit'], a.btnSearch, a.searchBtn")
+        for btn in btn_candidates:
+            try:
+                txt = (await btn.inner_text() or await btn.get_attribute("value") or "").strip()
+                if "検索" in txt and await btn.is_visible():
+                    async with page.expect_navigation(wait_until="domcontentloaded", timeout=25000):
+                        await btn.click()
+                    submitted = True
+                    break
+            except Exception:
+                continue
+
+        if not submitted:
+            try:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=25000):
+                    await search_input.press("Enter")
+                submitted = True
+            except Exception:
+                pass
+
+        await asyncio.sleep(2)
+        add_log(f"✅ **検索結果ページが表示されました:**\n`{page.url}`")
+
+        current_rank = 0
+        found = False
+        target_found_name = ""
+
+        # 4. サロン一覧の抽出（サロンIDごとに最上部の見出しのみを厳密採用）
+        for page_idx in range(1, search_pages + 1):
+            if page_idx > 1:
+                cur_url = page.url
+                if "/PN" in cur_url:
+                    next_url = re.sub(r"/PN\d+(\.html)?", f"/PN{page_idx}.html", cur_url)
+                elif "?" in cur_url:
+                    parts = cur_url.split("?")
+                    next_url = f"{parts[0].rstrip('/')}/PN{page_idx}.html?{parts[1]}"
+                else:
+                    next_url = f"{cur_url.rstrip('/')}/PN{page_idx}.html"
+
+                add_log(f"\n🔍 **{page_idx}ページ目をスキャン中...** (`{next_url}`)")
+                await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(2)
+
+            # ページ内のサロン個別トップリンク（/slnH.../）を走査
             links = await page.query_selector_all("a[href*='/kr/slnH']")
 
             page_shops = []
@@ -163,6 +230,8 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
 
             for link in links:
                 href = await link.get_attribute("href") or ""
+                
+                # サロン個別トップ（/slnH.../）のみを対象にし、写真・クーポン等のサブページは除外
                 m_sln = re.search(r"/(slnH\d+)/?$", href.split("?")[0])
                 if not m_sln:
                     continue
@@ -174,9 +243,10 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 raw_text = (await link.inner_text()).strip()
                 salon_name = raw_text.split("\n")[0].strip()
 
-                # 写真枚数（〇枚）やボタンテキストを除外
+                # 写真枚数（〇枚）や短すぎるテキストを除外
                 if re.search(r"^\d+枚$", salon_name) or len(salon_name) <= 2:
                     continue
+                # ボタン文言等を除外
                 if any(bad in salon_name for bad in ["空席確認", "予約する", "地図を見る", "クーポン一覧"]):
                     continue
 
@@ -193,6 +263,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 current_rank += 1
                 add_log(f"{current_rank}位: **{name}**")
 
+                # 部分一致判定（大文字・小文字を無視）
                 if shop_target.lower() in name.lower():
                     found = True
                     target_found_name = name
