@@ -112,16 +112,13 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
     found = False
     target_found_name = ""
 
-    # URLからmac（中エリア）とsac（小エリア）コードを抽出
-    mac_m = re.search(r"/(mac[A-Z0-9]+)", raw_url)
+    # 小エリアコード（sacX...）のみを正確に抽出
     sac_m = re.search(r"/(sacX\d+)", raw_url)
-    mac_code = mac_m.group(1) if mac_m else ""
     sac_code = sac_m.group(1) if sac_m else ""
 
     encoded_kw = quote(target_kw)
 
     async with async_playwright() as p:
-        # メモリ制限下でも安定する標準引数
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -139,16 +136,20 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         )
         page = await context.new_page()
 
-        # 画像やフォントなど不要なアセットのみ遮断
+        # 画像やフォント等の不要リソースをブロック
         await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", lambda r: r.abort())
 
         # ページ巡回
         for page_idx in range(1, search_pages + 1):
-            # ホットペッパー正規検索エンジンURL（/CSP/kr/salonSearch/search/）へ直結
-            search_url = (
-                f"https://beauty.hotpepper.jp/CSP/kr/salonSearch/search/"
-                f"?mac={mac_code}&sac={sac_code}&fw={encoded_kw}&pn={page_idx}"
-            )
+            # 中エリアコード（mac）の不整合を避けるため、小エリアコード（sac）とキーワード（fw）のみでクエリを構築
+            if sac_code:
+                search_url = (
+                    f"https://beauty.hotpepper.jp/CSP/kr/salonSearch/search/"
+                    f"?sac={sac_code}&fw={encoded_kw}&pn={page_idx}"
+                )
+            else:
+                target_base = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/")
+                search_url = f"{target_base}/PN{page_idx}.html?fw={encoded_kw}"
 
             add_log(f"🔍 **{page_idx}ページ目を検索中...**\n`{search_url}`")
 
@@ -159,7 +160,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 add_log(f"⚠️ ページアクセス失敗: {e}")
                 break
 
-            # サロン個別トップリンク（/slnH.../）のみを厳密抽出
+            # サロンリンク（/slnH.../）を走査
             links = await page.query_selector_all("a[href*='/kr/slnH']")
 
             page_shops = []
@@ -167,7 +168,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
 
             for link in links:
                 href = await link.get_attribute("href") or ""
-                # /slnH000xxxxxx/ の形式のみ
                 m_sln = re.search(r"/(slnH\d+)/?$", href.split("?")[0])
                 if not m_sln:
                     continue
@@ -179,7 +179,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 raw_text = (await link.inner_text()).strip()
                 salon_name = raw_text.split("\n")[0].strip()
 
-                # 写真枚数（〇枚）やボタンテキストを除外
                 if re.search(r"^\d+枚$", salon_name) or len(salon_name) <= 2:
                     continue
                 if any(bad in salon_name for bad in ["空席確認", "予約する", "地図を見る", "クーポン一覧"]):
