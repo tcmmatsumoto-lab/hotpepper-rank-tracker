@@ -3,7 +3,6 @@ import streamlit as st
 import asyncio
 import pandas as pd
 import re
-from urllib.parse import quote
 from playwright.async_api import async_playwright
 
 # Streamlit Cloud環境用セットアップ
@@ -18,7 +17,7 @@ setup_playwright()
 
 st.set_page_config(page_title="HotPepper順位トラッカー", layout="centered")
 st.title("HotPepper 順位トラッカー")
-st.caption("小エリアマスターから正規検索エンジンへ直結し、正確な掲載順位を測定します。")
+st.caption("小エリアページから検索フォームを実行し、正確な掲載順位を測定します。")
 
 # 1. Googleスプレッドシートの読み込み
 SHEET_ID = "1HGmMHV4dEUQUy9VFEIc32erKUrhdOFUd4kYN-oEA4-c"
@@ -86,7 +85,10 @@ if df_areas is not None and not df_areas.empty:
     matched_row = filtered_mid[filtered_mid["_small"] == selected_small_name]
     if not matched_row.empty:
         selected_url = matched_row["_url"].values[0]
-        st.info(f"📌 対象小エリアURL: `{selected_url}`")
+        # 池袋なのにmacAB（新橋）になっている場合の自動補正
+        if "sacX007" in selected_url and "macAB" in selected_url:
+            selected_url = selected_url.replace("macAB", "macAE")
+        st.info(f"📌 開く小エリアURL: `{selected_url}`")
     else:
         st.warning("⚠️ エリアURLが見つかりませんでした。")
 else:
@@ -101,7 +103,7 @@ with col_kw:
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. 直結検索＆安定順位計測ロジック
+# 3. 完全ブラウザ操作検索ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
@@ -111,12 +113,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
     current_rank = 0
     found = False
     target_found_name = ""
-
-    # 小エリアコード（sacX...）のみを正確に抽出
-    sac_m = re.search(r"/(sacX\d+)", raw_url)
-    sac_code = sac_m.group(1) if sac_m else ""
-
-    encoded_kw = quote(target_kw)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -136,31 +132,81 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         )
         page = await context.new_page()
 
-        # 画像やフォント等の不要リソースをブロック
+        # 画像やフォント等の不要リソースをブロックして高速化
         await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", lambda r: r.abort())
 
-        # ページ巡回
-        for page_idx in range(1, search_pages + 1):
-            # 中エリアコード（mac）の不整合を避けるため、小エリアコード（sac）とキーワード（fw）のみでクエリを構築
-            if sac_code:
-                search_url = (
-                    f"https://beauty.hotpepper.jp/CSP/kr/salonSearch/search/"
-                    f"?sac={sac_code}&fw={encoded_kw}&pn={page_idx}"
-                )
-            else:
-                target_base = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/")
-                search_url = f"{target_base}/PN{page_idx}.html?fw={encoded_kw}"
+        target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
+        add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
-            add_log(f"🔍 **{page_idx}ページ目を検索中...**\n`{search_url}`")
+        try:
+            await page.goto(target_area_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            add_log(f"❌ ページアクセス失敗: {e}")
+            await browser.close()
+            return 0, False, ""
 
+        # フォームに直接キーワードをセットして送信
+        add_log(f"2️⃣ **検索ウィンドウに「{target_kw}」を入力して検索を実行します...**")
+        
+        # JavaScript経由でフリーワード欄に値を入れ、検索フォームを直接submit
+        search_executed = await page.evaluate(f'''() => {{
+            let inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])'));
+            let targetInput = inputs.find(i => 
+                (i.name && i.name.includes('fw')) || 
+                (i.id && i.id.includes('freeword')) || 
+                (i.placeholder && (i.placeholder.includes('キーワード') || i.placeholder.includes('サロン')))
+            ) || inputs[0];
+
+            if (targetInput) {{
+                targetInput.value = "{target_kw}";
+                if (targetInput.form) {{
+                    targetInput.form.submit();
+                    return true;
+                }}
+            }}
+            return false;
+        }}''')
+
+        if search_executed:
             try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(2)
-            except Exception as e:
-                add_log(f"⚠️ ページアクセス失敗: {e}")
-                break
+                await page.wait_for_load_state("domcontentloaded", timeout=25000)
+            except Exception:
+                pass
+        else:
+            # フォールバック：通常のPlaywright入力
+            inp = await page.query_selector("input[name*='fw'], input#freeword, .searchBox input")
+            if inp:
+                await inp.fill(target_kw)
+                await inp.press("Enter")
+                await page.wait_for_load_state("domcontentloaded", timeout=25000)
+            else:
+                add_log("❌ 検索窓が見つかりませんでした。")
+                await browser.close()
+                return 0, False, ""
 
-            # サロンリンク（/slnH.../）を走査
+        await asyncio.sleep(2)
+        add_log(f"✅ **検索結果ページが表示されました:**\n`{page.url}`")
+
+        # サロン一覧の抽出
+        for page_idx in range(1, search_pages + 1):
+            if page_idx > 1:
+                cur_url = page.url
+                if "/PN" in cur_url:
+                    next_url = re.sub(r"/PN\d+(\.html)?", f"/PN{page_idx}.html", cur_url)
+                elif "pn=" in cur_url:
+                    next_url = re.sub(r"pn=\d+", f"pn={page_idx}", cur_url)
+                elif "?" in cur_url:
+                    parts = cur_url.split("?")
+                    next_url = f"{parts[0].rstrip('/')}/PN{page_idx}.html?{parts[1]}"
+                else:
+                    next_url = f"{cur_url.rstrip('/')}/PN{page_idx}.html"
+
+                add_log(f"\n🔍 **{page_idx}ページ目をスキャン中...** (`{next_url}`)")
+                await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(2)
+
+            # 店舗カセット内の店舗名リンクを収集
             links = await page.query_selector_all("a[href*='/kr/slnH']")
 
             page_shops = []
@@ -179,6 +225,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 raw_text = (await link.inner_text()).strip()
                 salon_name = raw_text.split("\n")[0].strip()
 
+                # 写真枚数（〇枚）やボタンテキストを除外
                 if re.search(r"^\d+枚$", salon_name) or len(salon_name) <= 2:
                     continue
                 if any(bad in salon_name for bad in ["空席確認", "予約する", "地図を見る", "クーポン一覧"]):
