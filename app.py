@@ -1,13 +1,19 @@
 import os
-
-# Streamlit Cloud（Linux環境）でPlaywrightのブラウザを自動インストール
-os.system("playwright install chromium")
-
 import streamlit as st
 import asyncio
 import pandas as pd
 import re
 from playwright.async_api import async_playwright
+
+# Streamlit Cloud環境のみ Playwrightブラウザを確実にセットアップ
+@st.cache_resource
+def setup_playwright():
+    try:
+        os.system("playwright install chromium")
+    except Exception:
+        pass
+
+setup_playwright()
 
 st.set_page_config(page_title="HotPepper順位トラッカー", layout="centered")
 st.title("HotPepper 順位トラッカー")
@@ -87,15 +93,14 @@ else:
 
 col_shop, col_kw = st.columns(2)
 with col_shop:
-    shop_name = st.text_input("自店舗名（部分一致OK）"
-                              , key="ui_shop_key")
+    shop_name = st.text_input("自店舗名（部分一致OK）", placeholder="例: LUMICIA", key="ui_shop_key")
 with col_kw:
     keyword = st.text_input("検索キーワード", placeholder="例: 眉毛", key="ui_kw_key")
 
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. 検索実行＆サロン判定ロジック
+# 3. クラウド安定起動オプション付き計測ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
@@ -103,7 +108,18 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         log_box.markdown("\n\n".join(logs))
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # Linux/クラウド環境でもクラッシュしないための厳格な起動オプション
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--single-process"
+            ]
+        )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 900}
@@ -111,7 +127,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         page = await context.new_page()
         await page.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", lambda r: r.abort())
 
-        # 1. 小エリアURLを開く
         target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
         add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
@@ -123,7 +138,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
             await browser.close()
             return 0, False, ""
 
-        # 2. 検索窓口の特定
+        # 検索窓の特定
         search_input = None
         inputs = await page.query_selector_all("input")
         for inp in inputs:
@@ -154,7 +169,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
             await browser.close()
             return 0, False, ""
 
-        # 3. 入力して検索を実行
         await search_input.scroll_into_view_if_needed()
         await search_input.click()
         await search_input.fill("")
@@ -191,7 +205,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         found = False
         target_found_name = ""
 
-        # 4. サロン一覧の抽出（サロンIDごとに最上部の見出しのみを厳密採用）
+        # サロン一覧の抽出
         for page_idx in range(1, search_pages + 1):
             if page_idx > 1:
                 cur_url = page.url
@@ -207,7 +221,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2)
 
-            # ページ内のすべてのリンクからサロン詳細（slnH...）を走査
             links = await page.query_selector_all("a[href*='/kr/slnH']")
 
             page_shops = []
@@ -215,8 +228,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
 
             for link in links:
                 href = await link.get_attribute("href") or ""
-                
-                # サロン個別トップ（/slnH.../）のみを対象にし、写真・クーポン等のサブページは除外
                 m_sln = re.search(r"/(slnH\d+)/?$", href.split("?")[0])
                 if not m_sln:
                     continue
@@ -228,10 +239,8 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 raw_text = (await link.inner_text()).strip()
                 salon_name = raw_text.split("\n")[0].strip()
 
-                # 写真枚数（〇枚）や短すぎるテキストを除外
                 if re.search(r"^\d+枚$", salon_name) or len(salon_name) <= 2:
                     continue
-                # ボタン文言等を除外
                 if any(bad in salon_name for bad in ["空席確認", "予約する", "地図を見る", "クーポン一覧"]):
                     continue
 
@@ -248,7 +257,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 current_rank += 1
                 add_log(f"{current_rank}位: **{name}**")
 
-                # 部分一致判定（大文字・小文字を無視）
                 if shop_target.lower() in name.lower():
                     found = True
                     target_found_name = name
@@ -285,3 +293,4 @@ if st.button("順位を計測する", type="primary", key="ui_btn_measure"):
             st.metric(label=f"「{selected_small_name}」×「{keyword}」の検索順位", value=f"{rank} 位")
         else:
             st.warning(f"指定された {max_pages} ページ以内（計 {rank} 店舗中）に「{shop_name}」は見つかりませんでした。")
+            
