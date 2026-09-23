@@ -5,7 +5,7 @@ import pandas as pd
 import re
 from playwright.async_api import async_playwright
 
-# Streamlit Cloud環境（Linux）でPlaywrightのブラウザを自動セットアップ
+# Streamlit Cloud環境用セットアップ
 @st.cache_resource
 def setup_playwright():
     try:
@@ -84,7 +84,6 @@ if df_areas is not None and not df_areas.empty:
 
     matched_row = filtered_mid[filtered_mid["_small"] == selected_small_name]
     if not matched_row.empty:
-        # スプレッドシートのURLを改変せずそのまま使用
         selected_url = matched_row["_url"].values[0]
         st.info(f"📌 開く小エリアURL: `{selected_url}`")
     else:
@@ -101,7 +100,7 @@ with col_kw:
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. 本番用 Playwright 検索・順位判定ロジック
+# 3. 超省メモリ Playwright 検索・順位判定ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
@@ -113,7 +112,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
     target_found_name = ""
 
     async with async_playwright() as p:
-        # メモリ浪費を防ぎつつLinuxコンテナでも安定する最小構成
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -121,6 +119,8 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--single-process",
+                "--no-zygote",
                 "--mute-audio"
             ]
         )
@@ -130,10 +130,9 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         )
         page = await context.new_page()
 
-        # 画像のみ遮断（CSSやJSは残すことでレイアウトと描画処理を維持）
+        # 画像のみ遮断してメモリを大幅節約
         await page.route("**/*.{png,jpg,jpeg,webp,gif}", lambda r: r.abort())
 
-        # ジャンル部のみ置換してスプレッドシートのURLを開く
         target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
         add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
@@ -225,7 +224,6 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2)
 
-            # 店舗リンクを収集
             links = await page.query_selector_all("a[href*='slnH']")
 
             page_shops = []
