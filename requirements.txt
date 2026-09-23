@@ -1,4 +1,4 @@
 streamlit
 pandas
-playwright
+requests
 beautifulsoup4
