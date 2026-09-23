@@ -5,7 +5,7 @@ import pandas as pd
 import re
 from playwright.async_api import async_playwright
 
-# Streamlit Cloud環境用セットアップ
+# Streamlit Cloud環境（Linux）でPlaywrightのブラウザを自動セットアップ
 @st.cache_resource
 def setup_playwright():
     try:
@@ -17,7 +17,7 @@ setup_playwright()
 
 st.set_page_config(page_title="HotPepper順位トラッカー", layout="centered")
 st.title("HotPepper 順位トラッカー")
-st.caption("小エリアURLからキーワード検索を実行し、掲載順位を測定します。")
+st.caption("スプレッドシートの小エリアURLからキーワード検索を実行し、掲載順位を測定します。")
 
 # 1. Googleスプレッドシートの読み込み
 SHEET_ID = "1HGmMHV4dEUQUy9VFEIc32erKUrhdOFUd4kYN-oEA4-c"
@@ -84,7 +84,7 @@ if df_areas is not None and not df_areas.empty:
 
     matched_row = filtered_mid[filtered_mid["_small"] == selected_small_name]
     if not matched_row.empty:
-        # スプレッドシートのURLをそのまま使用（コード置換は一切行わない）
+        # スプレッドシートのURLを改変せずそのまま使用
         selected_url = matched_row["_url"].values[0]
         st.info(f"📌 開く小エリアURL: `{selected_url}`")
     else:
@@ -101,7 +101,7 @@ with col_kw:
 max_pages = st.slider("調べるページ数（1ページ＝約20〜30店舗）", min_value=1, max_value=5, value=2, key="ui_max_pages")
 
 
-# 3. 成功時ベースの検索＆順位判定ロジック（スプシのURLをそのまま使用）
+# 3. 本番用 Playwright 検索・順位判定ロジック
 async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, log_box):
     logs = []
     def add_log(msg):
@@ -113,6 +113,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
     target_found_name = ""
 
     async with async_playwright() as p:
+        # メモリ浪費を防ぎつつLinuxコンテナでも安定する最小構成
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -125,11 +126,14 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900}
+            viewport={"width": 1280, "height": 800}
         )
         page = await context.new_page()
 
-        # ジャンル部のみ選択に合わせて置換し、スプシのURLをそのまま開く
+        # 画像のみ遮断（CSSやJSは残すことでレイアウトと描画処理を維持）
+        await page.route("**/*.{png,jpg,jpeg,webp,gif}", lambda r: r.abort())
+
+        # ジャンル部のみ置換してスプレッドシートのURLを開く
         target_area_url = re.sub(r"/(nail|relax|este)/", f"/{genre_key}/", raw_url).rstrip("/") + "/"
         add_log(f"1️⃣ **小エリアのURLを開いています...**\n`{target_area_url}`")
 
@@ -141,31 +145,24 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
             await browser.close()
             return 0, False, ""
 
-        # 検索窓口の特定
+        # 検索入力枠の特定
         search_input = None
-        inputs = await page.query_selector_all("input")
-        for inp in inputs:
+        selectors = ["input[name='fw']", "input#freeword", "input[placeholder*='キーワード']", "input[placeholder*='サロン']"]
+        for sel in selectors:
             try:
-                inp_type = (await inp.get_attribute("type") or "text").lower()
-                if inp_type in ["text", "search"]:
-                    name_attr = (await inp.get_attribute("name") or "").lower()
-                    id_attr = (await inp.get_attribute("id") or "").lower()
-                    ph_attr = (await inp.get_attribute("placeholder") or "").lower()
-                    if any(k in name_attr or k in id_attr or k in ph_attr for k in ["fw", "free", "word", "keyword", "サロン", "キーワード"]):
-                        search_input = inp
-                        break
+                el = await page.wait_for_selector(sel, timeout=3000, state="visible")
+                if el:
+                    search_input = el
+                    break
             except Exception:
                 continue
 
         if not search_input:
+            inputs = await page.query_selector_all("input[type='text'], input[type='search']")
             for inp in inputs:
-                try:
-                    inp_type = (await inp.get_attribute("type") or "text").lower()
-                    if inp_type in ["text", "search"] and await inp.is_visible():
-                        search_input = inp
-                        break
-                except Exception:
-                    continue
+                if await inp.is_visible():
+                    search_input = inp
+                    break
 
         if not search_input:
             add_log("❌ 検索窓が見つかりませんでした。")
@@ -179,13 +176,19 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
         add_log(f"2️⃣ **検索ウィンドウに「{target_kw}」を入力しました。**")
         await asyncio.sleep(0.5)
 
+        # 検索ボタンを押下
         add_log("3️⃣ **検索ボタンを押して検索を実行します...**")
         submitted = False
-        btn_candidates = await page.query_selector_all("button, input[type='submit'], a.btnSearch, a.searchBtn")
-        for btn in btn_candidates:
+        btn_selectors = [
+            "input[type='submit'][value*='検索']",
+            "button[type='submit']",
+            ".searchBtn",
+            "a.btnSearch"
+        ]
+        for bsel in btn_selectors:
             try:
-                txt = (await btn.inner_text() or await btn.get_attribute("value") or "").strip()
-                if "検索" in txt and await btn.is_visible():
+                btn = await page.query_selector(bsel)
+                if btn and await btn.is_visible():
                     async with page.expect_navigation(wait_until="domcontentloaded", timeout=25000):
                         await btn.click()
                     submitted = True
@@ -222,7 +225,7 @@ async def check_rank(raw_url, genre_key, target_kw, shop_target, search_pages, l
                 await page.goto(next_url, wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2)
 
-            # 店舗リンク抽出（成功時の判定ロジック）
+            # 店舗リンクを収集
             links = await page.query_selector_all("a[href*='slnH']")
 
             page_shops = []
